@@ -4,6 +4,7 @@ import numpy as np
 from torch.utils.data.dataset import ConcatDataset as _ConcatDataset
 from .instance_set import InstanceSet, my_collate
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler as DistSampler
 
 
 class ConcatDataset(_ConcatDataset):
@@ -60,10 +61,15 @@ def build_dataset(data_cfg):
         return InstanceSet(data_cfg, data_cfg['data_type'])
 
 
-def build_dataloader(data_cfg):
+def build_dataloader(data_cfg, distrubute=False):
     dataset = build_dataset(data_cfg)
-    data_loader = DataLoader(dataset, batch_size=data_cfg['batch_size'], collate_fn=my_collate, shuffle=True,
-                             num_workers=data_cfg['num_works'])
+    if distrubute:
+        dist_sampler = DistSampler(dataset)
+    else:
+        dist_sampler = None
+    data_loader = DataLoader(dataset, batch_size=data_cfg['batch_size'], collate_fn=my_collate,
+                             num_workers=data_cfg['num_works'], sampler=dist_sampler,
+                             shuffle=(dist_sampler is None))
     return data_loader
 
 

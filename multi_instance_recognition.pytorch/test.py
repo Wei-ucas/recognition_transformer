@@ -23,7 +23,7 @@ from model import MultiInstanceRecognition
 from data_tools.instance_set import ImgInstanceLoader
 
 torch.backends.cudnn.enabled = False
-
+from data_tools.concat_dataset import build_dataloader
 
 def test(args, cpks):
 
@@ -31,7 +31,7 @@ def test(args, cpks):
 
     voc, char2id, id2char = get_vocabulary("ALLCASES_SYMBOLS")
 
-    test_data = ImgInstanceLoader(args.val_data_cfg)
+    test_data = build_dataloader(args.val_data_cfg)
     print("test data: {}".format(len(test_data)))
 
     model = MultiInstanceRecognition(args.model_cfg).cuda()

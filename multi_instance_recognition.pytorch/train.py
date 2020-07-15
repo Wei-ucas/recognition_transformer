@@ -13,49 +13,50 @@ from torch.optim import lr_scheduler
 import torch.utils.data
 import numpy as np
 from mmcv import Config
-from mmcv.parallel import MMDataParallel
+from torch.nn.parallel.distributed import DistributedDataParallel
+import torch.distributed as dist
 from data_tools.data_utils import get_vocabulary
 from utils.transcription_utils import idx2label, calc_metrics
-
+import logging
 from model import MultiInstanceRecognition
 # from data_tools.instance_set import ImgInstanceLoader
 from data_tools.concat_dataset import build_dataloader
+from utils.logging import setup_logger
+from utils.dist_reduce import reduce_loss_dict, get_rank
 
 torch.backends.cudnn.enabled = False
 
 
-def train(args):
-    train_data = build_dataloader(args.train_data_cfg)
-    print("train data: {}".format(len(train_data)))
-    val_data = build_dataloader(args.val_data_cfg)
-    print("val data: {}".format(len(val_data)))
+def train(cfg, args):
+    logger = logging.getLogger('model training')
+    train_data = build_dataloader(cfg.train_data_cfg, args.distributed)
+    logger.info("train data: {}".format(len(train_data)))
+    val_data = build_dataloader(cfg.val_data_cfg, args.distributed)
+    logger.info("val data: {}".format(len(val_data)))
 
-    model = MultiInstanceRecognition(args.model_cfg).cuda()
-    # model = MMDataParallel(model).cuda()
+    model = MultiInstanceRecognition(cfg.model_cfg).cuda()
+    if cfg.resume_from is not None:
+        logger.info('loading pretrained models from {opt.continue_model}')
+        model.load_state_dict(torch.load(cfg.resume_from))
+    if args.distributed:
+        model = DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank)
     voc, char2id, id2char = get_vocabulary("ALLCASES_SYMBOLS")
-    if args.resume_from is not None:
-        print('loading pretrained models from {opt.continue_model}')
-        model.load_state_dict(torch.load(args.resume_from))
 
     filtered_parameters = []
     params_num = []
     for p in filter(lambda p: p.requires_grad, model.parameters()):
         filtered_parameters.append(p)
         params_num.append(np.prod(p.size()))
-    print('Trainable params num : ', sum(params_num))
-    optimizer = optim.Adam(filtered_parameters, lr=args.lr, betas=(0.9, 0.999))
+    logger.info('Trainable params num : ', sum(params_num))
+    optimizer = optim.Adam(filtered_parameters, lr=cfg.lr, betas=(0.9, 0.999))
     lrScheduler = lr_scheduler.MultiStepLR(optimizer, [1, 2, 3], gamma=0.1)
 
-    max_iters = args.max_iters
+    max_iters = cfg.max_iters
     start_iter = 0
-    if args.resume_from is not None:
-        start_iter = int(args.resume_from.split('_')[-1].split('.')[0])
-        print('continue to train, start_iter: {start_iter}')
+    if cfg.resume_from is not None:
+        start_iter = int(cfg.resume_from.split('_')[-1].split('.')[0])
+        logger.info('continue to train, start_iter: {start_iter}')
 
-    log_file = open(os.path.join(args.save_name, 'train_log.txt'), 'w')
-    log_file.write('gpu :{}\n'.format(os.environ['CUDA_VISIBLE_DEVICES']))
-    for i in args.keys():
-        log_file.write(i + ': {}\n'.format(args[i]))
     train_data_iter = iter(train_data)
     val_data_iter = iter(val_data)
     start_time = time.time()
@@ -76,9 +77,9 @@ def train(args):
             batch_text_labels, batch_text_labels_mask, batch_words = \
                 batch_data
 
-        batch_imgs = batch_imgs.cuda()
-        batch_rectangles = batch_rectangles.cuda()
-        batch_text_labels = batch_text_labels.cuda()
+        batch_imgs = batch_imgs.cuda(non_blocking=True)
+        batch_rectangles = batch_rectangles.cuda(non_blocking=True)
+        batch_text_labels = batch_text_labels.cuda(non_blocking=True)
         data_time = time.time() - data_time_s
         # print(time.time() -s)
         # s = time.time()
@@ -87,26 +88,27 @@ def train(args):
         # print(time.time() - s)
         # print('------')
         # s = time.time()
-        model.zero_grad()
-        loss = loss.mean()
-        loss.backward()
-        # torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-        optimizer.step()
+        loss = loss.mean()
+        print(loss)
         # del loss
         # print(time.time() - s)
         # print('------')
 
-        if i % args.train_verbose == 0:
+        if i % cfg.train_verbose == 0:
             this_time = time.time() - start_time
-            log_info = "train iter :{}, time: {:.2f}, data_time: {:.2f}, Loss: {:.3f}".format(i, this_time, data_time*100, loss.data)
-            log_file.write(log_info + '\n')
-            print(log_info)
+            if args.distributed:
+                loss = dist.reduce(loss,0)
+            log_info = "train iter :{}, time: {:.2f}, data_time: {:.2f}, Loss: {:.3f}".format(i, this_time, data_time, loss.data)
+            logger.info(log_info)
             torch.cuda.empty_cache()
             # break
 
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
         del loss
-        if i % args.val_iter == 0:
+        if i % cfg.val_iter == 0:
             print("--------Val iteration---------")
             model.eval()
 
@@ -125,9 +127,9 @@ def train(args):
                 batch_text_labels, batch_text_labels_mask, batch_words = \
                     val_batch
             del val_batch
-            batch_imgs = batch_imgs.cuda()
-            batch_rectangles = batch_rectangles.cuda()
-            batch_text_labels = batch_text_labels.cuda()
+            batch_imgs = batch_imgs.cuda(non_blocking=True)
+            batch_rectangles = batch_rectangles.cuda(non_blocking=True)
+            batch_text_labels = batch_text_labels.cuda(non_blocking=True)
             with torch.no_grad():
                 val_loss, val_pred_logits = model(batch_imgs, batch_text_labels, batch_rectangles, batch_text_labels_mask)
             pred_labels = val_pred_logits.argmax(dim=2).cpu().numpy()
@@ -139,25 +141,27 @@ def train(args):
             val_dec_metrics_result = calc_metrics(pred_value_str,
                                                   gt_str, metrics_type="accuracy")
             this_time = time.time() - start_time
-            log_info = "val iter :{}, time: {:.2f} Loss: {:.3f}, acc: {:.2f}".format(i, this_time, val_loss.mean().data, val_dec_metrics_result)
-            log_file.write(log_info + '\n')
-            print(log_info)
+            if args.distributed:
+                loss = dist.reduce(val_loss,0)
+            log_info = "val iter :{}, time: {:.2f} Loss: {:.3f}, acc: {:.2f}".format(i, this_time, loss.mean().data, val_dec_metrics_result)
+            logger.info(log_info)
             del val_loss
-        if (i + 1) % args.save_iter == 0:
+        if (i + 1) % cfg.save_iter == 0:
             torch.save(
-                model.state_dict(), args.save_name + '_{}.pth'.format(i + 1)
+                model.state_dict(), cfg.save_name + '_{}.pth'.format(i + 1)
             )
-        if i > 0 and i % args.lr_step == 0:                # 调整学习速率
+        if i > 0 and i % cfg.lr_step == 0:                # 调整学习速率
             lrScheduler.step()
-            print("lr step")
+            logger.info("lr step")
         # torch.cuda.empty_cache()
     print('end the training')
-    log_file.close()
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a recognizer")
     parser.add_argument('config', help='config file')
+    parser.add_argument('--local_rank', default=-1, type=int,
+                        help='node rank for distributed training')
     # parser.add_argument('--')
     args = parser.parse_args()
     return args
@@ -166,9 +170,22 @@ def parse_args():
 def main():
     args = parse_args()
     cfg = Config.fromfile(args.config)
-    train(cfg)
+    if args.local_rank != -1:
+        dist.init_process_group(backend='nccl', init_method='env://')
+        torch.cuda.set_device(args.local_rank)
+    num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
+    args.distributed = num_gpus > 1
+    local_rank = args.local_rank
+
+    logger = setup_logger(__name__, cfg.save_name, get_rank())
+    logger.info("Using {} GPUs".format(num_gpus))
+    logger.info(args)
+    logger.info("Loaded configuration file {}".format(args.config))
+    logger.info(cfg._text)
+
+    train(cfg, args)
 
 
 if __name__ == '__main__':
-    os.environ['CUDA_VISIBLE_DEVICES'] = '5'
+    # os.environ['CUDA_VISIBLE_DEVICES'] = '5'
     main()

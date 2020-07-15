@@ -9,7 +9,7 @@ grad_clip = 5
 lr_step = 100000
 
 import os
-save_name = './cpks/no_crop_finetune/'
+save_name = './cpks/no_crop_finetune_1/'
 if not os.path.exists(save_name):
     os.mkdir(save_name)
 
@@ -22,9 +22,9 @@ train_data_cfg = dict(
     num_instances=4,
     crop_ratio=0.0,
     crop_random=True,
-    size=(480,640),
+    size=(600,1333),
     max_len=max_len,
-    batch_size=4,
+    batch_size=2,
     num_works=2,
     shuffle=True
 )
@@ -38,9 +38,9 @@ val_data_cfg = dict(
     num_instances=4,
     crop_ratio=0.0,
     crop_random=True,
-    size=(640,800),
+    size=(600,800),
     max_len=max_len,
-    batch_size=4,
+    batch_size=1,
     num_works=2,
     shuffle=False
 )
